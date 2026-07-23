@@ -1,0 +1,503 @@
+import sys
+import os
+import time
+import cv2
+import numpy as np
+import mediapipe as mp
+
+from PySide6.QtCore import Qt, QThread, Signal, Slot, QSize
+from PySide6.QtGui import QImage, QPixmap, QFont, QIcon, QColor
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLabel, QPushButton,
+    QVBoxLayout, QHBoxLayout, QFrame, QFileDialog, QScrollArea,
+    QGridLayout, QGraphicsDropShadowEffect, QSizePolicy
+)
+
+# =====================【配置与连接预设】=====================
+VIDEO_FILE_DEFAULT = "curry_shoot.mp4"
+SAVE_FOLDER = "capture_snap"
+
+if not os.path.exists(SAVE_FOLDER):
+    os.makedirs(SAVE_FOLDER)
+
+CUSTOM_POSE_CONNECTIONS = [
+    (11, 12), (11, 23), (12, 24), (23, 24),
+    (11, 13), (13, 15), (12, 14), (14, 16),
+    (23, 25), (25, 27), (24, 26), (26, 28),
+    (15, 17), (15, 19), (15, 21), (16, 18), (16, 20), (16, 22),
+    (27, 29), (27, 31), (28, 30), (28, 32)
+]
+
+def calculate_angle(a, b, c):
+    a, b, c = np.array(a), np.array(b), np.array(c)
+    ba = a - b
+    bc = c - b
+    cos_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6)
+    cos_angle = np.clip(cos_angle, -1.0, 1.0)
+    raw_angle = np.arccos(cos_angle) * 180.0 / np.pi
+    return int(min(raw_angle, 180 - raw_angle))
+
+
+# =====================【后台视频处理线程】=====================
+class ProcessingThread(QThread):
+    # 传递 (绘制后的帧, 角度, 状态文本, 颜色RGB元组)
+    frame_processed = Signal(np.ndarray, int, str, tuple)
+    
+    def __init__(self):
+        super().__init__()
+        self.running = True
+        self.is_pause = False
+        self.source_type = "camera"  # "camera" 或 "video"
+        self.video_path = VIDEO_FILE_DEFAULT
+        self.cap = None
+
+        # 初始化 MediaPipe
+        self.mp_pose = mp.solutions.pose
+        self.pose = self.mp_pose.Pose(
+            static_image_mode=False,
+            model_complexity=1,
+            smooth_landmarks=True,
+            min_detection_confidence=0.6,
+            min_tracking_confidence=0.6
+        )
+
+    def run(self):
+        self._init_cap()
+        pause_frame = None
+
+        while self.running:
+            if not self.cap or not self.cap.isOpened():
+                time.sleep(0.03)
+                continue
+
+            if not self.is_pause:
+                ret, raw_frame = self.cap.read()
+                if not ret:
+                    if self.source_type == "video":
+                        # 循环播放视频
+                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        continue
+                    else:
+                        time.sleep(0.03)
+                        continue
+                pause_frame = raw_frame.copy()
+            else:
+                if pause_frame is not None:
+                    raw_frame = pause_frame.copy()
+                else:
+                    time.sleep(0.03)
+                    continue
+
+            frame = cv2.resize(raw_frame, (1280, 720))
+            h, w, _ = frame.shape
+
+            image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            image.flags.writeable = False
+            results = self.pose.process(image)
+            image.flags.writeable = True
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+
+            elbow_angle = 0
+            status = "WAITING..."
+            color = (150, 150, 150)
+
+            if results.pose_landmarks:
+                landmarks = results.pose_landmarks.landmark
+                try:
+                    shoulder = [landmarks[self.mp_pose.PoseLandmark.RIGHT_SHOULDER].x * w,
+                                landmarks[self.mp_pose.PoseLandmark.RIGHT_SHOULDER].y * h]
+                    elbow = [landmarks[self.mp_pose.PoseLandmark.RIGHT_ELBOW].x * w,
+                             landmarks[self.mp_pose.PoseLandmark.RIGHT_ELBOW].y * h]
+                    wrist = [landmarks[self.mp_pose.PoseLandmark.RIGHT_WRIST].x * w,
+                             landmarks[self.mp_pose.PoseLandmark.RIGHT_WRIST].y * h]
+
+                    elbow_angle = calculate_angle(shoulder, elbow, wrist)
+                    elbow_pos = (int(elbow[0]) + 15, int(elbow[1]) - 15)
+                    cv2.putText(image, f"{elbow_angle} deg", elbow_pos,
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2, cv2.LINE_AA)
+
+                    if 80 <= elbow_angle <= 110:
+                        status = "EXCELLENT FORM"
+                        color = (46, 204, 113) # 绿色
+                    elif 60 <= elbow_angle < 80 or 110 < elbow_angle <= 130:
+                        status = "ACCEPTABLE"
+                        color = (241, 196, 15) # 黄色
+                    else:
+                        status = "NEEDS ADJUSTMENT"
+                        color = (231, 76, 60) # 红色
+                except Exception:
+                    pass
+
+                # 绘制无面部关键点骨架
+                lm_list = results.pose_landmarks.landmark
+                for (start_idx, end_idx) in CUSTOM_POSE_CONNECTIONS:
+                    s_lm, e_lm = lm_list[start_idx], lm_list[end_idx]
+                    sx, sy = int(s_lm.x * w), int(s_lm.y * h)
+                    ex, ey = int(e_lm.x * w), int(e_lm.y * h)
+                    cv2.line(image, (sx, sy), (ex, ey), (235, 64, 52), 3)
+
+                for idx in range(11, len(lm_list)):
+                    lm = lm_list[idx]
+                    cx, cy = int(lm.x * w), int(lm.y * h)
+                    cv2.circle(image, (cx, cy), 4, (0, 255, 255), -1)
+
+            self.frame_processed.emit(image, elbow_angle, status, color)
+            time.sleep(0.01)
+
+    def _init_cap(self):
+        if self.cap and self.cap.isOpened():
+            self.cap.release()
+        if self.source_type == "camera":
+            self.cap = cv2.VideoCapture(0)
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        else:
+            self.cap = cv2.VideoCapture(self.video_path)
+
+    def set_source(self, source_type, path=None):
+        self.source_type = source_type
+        if path:
+            self.video_path = path
+        self._init_cap()
+
+    def toggle_pause(self):
+        self.is_pause = not self.is_pause
+        return self.is_pause
+
+    def stop(self):
+        self.running = False
+        if self.cap and self.cap.isOpened():
+            self.cap.release()
+        self.wait()
+
+
+# =====================【主 UI 界面】=====================
+class BasketballAnalyzerUI(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("PRO-SHOOT | AI 投篮姿态分析与监测系统")
+        self.resize(1360, 820)
+        
+        self.current_frame = None
+
+        self._init_thread()
+        self._setup_ui()
+        self._apply_stylesheet()
+
+    def _init_thread(self):
+        self.thread = ProcessingThread()
+        self.thread.frame_processed.connect(self.on_frame_processed)
+        self.thread.start()
+
+    def _setup_ui(self):
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        main_layout = QHBoxLayout(main_widget)
+        main_layout.setContentsMargins(15, 15, 15, 15)
+        main_layout.setSpacing(15)
+
+        # ---------------- 左侧：主视屏区域 ----------------
+        left_box = QVBoxLayout()
+        
+        # 顶部标题栏
+        header_layout = QHBoxLayout()
+        title_label = QLabel("🏀 PRO-SHOOT MOTION CAPTURE")
+        title_label.setObjectName("HeaderTitle")
+        self.mode_badge = QLabel("CAMERA MODE")
+        self.mode_badge.setObjectName("BadgeCamera")
+        
+        header_layout.addWidget(title_label)
+        header_layout.addWidget(self.mode_badge)
+        header_layout.addStretch()
+        left_box.addLayout(header_layout)
+
+        # 视频渲染控件
+        self.video_label = QLabel()
+        self.video_label.setObjectName("VideoScreen")
+        self.video_label.setAlignment(Qt.AlignCenter)
+        self.video_label.setMinimumSize(850, 480)
+        self.video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        left_box.addWidget(self.video_label)
+
+        # 底部控制面板
+        controls_card = QFrame()
+        controls_card.setObjectName("Card")
+        btn_layout = QHBoxLayout(controls_card)
+        
+        self.btn_cam = QPushButton("📷 摄像头模式")
+        self.btn_video = QPushButton("📁 打开本地视频")
+        self.btn_pause = QPushButton("⏸️ 暂停 / 继续")
+        self.btn_snap = QPushButton("📸 动作抓拍 (S)")
+        
+        self.btn_cam.clicked.connect(self.switch_to_camera)
+        self.btn_video.clicked.connect(self.switch_to_video)
+        self.btn_pause.clicked.connect(self.toggle_pause)
+        self.btn_snap.clicked.connect(self.capture_snapshot)
+
+        btn_layout.addWidget(self.btn_cam)
+        btn_layout.addWidget(self.btn_video)
+        btn_layout.addWidget(self.btn_pause)
+        btn_layout.addWidget(self.btn_snap)
+        left_box.addWidget(controls_card)
+
+        main_layout.addLayout(left_box, stretch=3)
+
+        # ---------------- 右侧：分析仪表盘与抓拍栏 ----------------
+        right_box = QVBoxLayout()
+        right_box.setSpacing(15)
+
+        # 仪表盘卡片 1：实时角度仪表
+        gauge_card = QFrame()
+        gauge_card.setObjectName("Card")
+        gauge_layout = QVBoxLayout(gauge_card)
+        
+        gauge_title = QLabel("肘关节角度 (ELBOW ANGLE)")
+        gauge_title.setObjectName("SubTitle")
+        
+        self.angle_display = QLabel("0°")
+        self.angle_display.setObjectName("AngleDisplay")
+        self.angle_display.setAlignment(Qt.AlignCenter)
+
+        self.status_box = QLabel("READY")
+        self.status_box.setObjectName("StatusBox")
+        self.status_box.setAlignment(Qt.AlignCenter)
+
+        gauge_layout.addWidget(gauge_title)
+        gauge_layout.addWidget(self.angle_display)
+        gauge_layout.addWidget(self.status_box)
+        right_box.addWidget(gauge_card)
+
+        # 仪表盘卡片 2：姿态指标区间参考
+        ref_card = QFrame()
+        ref_card.setObjectName("Card")
+        ref_layout = QVBoxLayout(ref_card)
+        ref_title = QLabel("标准出手评级指标")
+        ref_title.setObjectName("SubTitle")
+        
+        ref_info = QLabel(
+            "🟢 80° - 110° : 最佳出手角度 (Excellent)\n"
+            "🟡 60° - 80° / 110° - 130° : 可接受 (Good)\n"
+            "🔴 <60° 或 >130° : 姿态偏差较大 (Bad)"
+        )
+        ref_info.setObjectName("RefText")
+        ref_layout.addWidget(ref_title)
+        ref_layout.addWidget(ref_info)
+        right_box.addWidget(ref_card)
+
+        # 仪表盘卡片 3：抓拍快照相册
+        snap_card = QFrame()
+        snap_card.setObjectName("Card")
+        snap_layout = QVBoxLayout(snap_card)
+        
+        snap_header = QHBoxLayout()
+        snap_title = QLabel("关键帧抓拍")
+        snap_title.setObjectName("SubTitle")
+        btn_open_folder = QPushButton("打开文件夹")
+        btn_open_folder.setObjectName("BtnSmall")
+        btn_open_folder.clicked.connect(lambda: os.startfile(os.path.abspath(SAVE_FOLDER)))
+        snap_header.addWidget(snap_title)
+        snap_header.addStretch()
+        snap_header.addWidget(btn_open_folder)
+
+        # 缩略图滚动视图
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setObjectName("ScrollArea")
+        
+        self.gallery_widget = QWidget()
+        self.gallery_layout = QGridLayout(self.gallery_widget)
+        self.gallery_layout.setContentsMargins(5, 5, 5, 5)
+        self.gallery_layout.setSpacing(8)
+        self.scroll_area.setWidget(self.gallery_widget)
+
+        snap_layout.addLayout(snap_header)
+        snap_layout.addWidget(self.scroll_area)
+        right_box.addWidget(snap_card, stretch=1)
+
+        main_layout.addLayout(right_box, stretch=1)
+
+        # 载入现有快照
+        self.refresh_gallery()
+
+    # ---------------- UI 响应与逻辑 ----------------
+    @Slot(np.ndarray, int, str, tuple)
+    def on_frame_processed(self, cv_img, angle, status, color_rgb):
+        self.current_frame = cv_img.copy()
+
+        # 图像转为 QPixmap 渲染
+        h, w, ch = cv_img.shape
+        bytes_per_line = ch * w
+        q_img = QImage(cv_img.data, w, h, bytes_per_line, QImage.Format_BGR888)
+        pixmap = QPixmap.fromImage(q_img)
+        self.video_label.setPixmap(
+            pixmap.scaled(self.video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        )
+
+        # 更新仪表盘
+        self.angle_display.setText(f"{angle}°")
+        self.status_box.setText(status)
+        r, g, b = color_rgb
+        self.status_box.setStyleSheet(f"""
+            background-color: rgba({r}, {g}, {b}, 0.2);
+            color: rgb({r}, {g}, {b});
+            border: 1px solid rgb({r}, {g}, {b});
+            border-radius: 6px;
+            font-weight: bold;
+            font-size: 16px;
+            padding: 8px;
+        """)
+
+    def switch_to_camera(self):
+        self.thread.set_source("camera")
+        self.mode_badge.setText("CAMERA MODE")
+        self.mode_badge.setObjectName("BadgeCamera")
+        self.mode_badge.setStyle(self.mode_badge.style())
+
+    def switch_to_video(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "选择本地投篮视频", "", "Video Files (*.mp4 *.avi *.mov)")
+        if file_path:
+            self.thread.set_source("video", file_path)
+            self.mode_badge.setText("VIDEO MODE")
+            self.mode_badge.setObjectName("BadgeVideo")
+            self.mode_badge.setStyle(self.mode_badge.style())
+
+    def toggle_pause(self):
+        is_paused = self.thread.toggle_pause()
+        self.btn_pause.setText("▶️ 继续" if is_paused else "⏸️ 暂停")
+
+    def capture_snapshot(self):
+        if self.current_frame is not None:
+            save_name = os.path.join(SAVE_FOLDER, f"snap_{int(time.time())}.jpg")
+            cv2.imwrite(save_name, self.current_frame)
+            self.refresh_gallery()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_S:
+            self.capture_snapshot()
+        elif event.key() == Qt.Key_Space:
+            self.toggle_pause()
+        else:
+            super().keyPressEvent(event)
+
+    def refresh_gallery(self):
+        # 清除现有缩略图
+        for i in reversed(range(self.gallery_layout.count())): 
+            widget = self.gallery_layout.itemAt(i).widget()
+            if widget:
+                widget.setParent(None)
+
+        files = sorted([f for f in os.listdir(SAVE_FOLDER) if f.endswith(('.jpg', '.png'))], reverse=True)
+        for idx, file_name in enumerate(files[:10]):  # 最多展示前 10 张
+            file_path = os.path.join(SAVE_FOLDER, file_name)
+            pixmap = QPixmap(file_path).scaled(110, 80, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            
+            lbl = QLabel()
+            lbl.setPixmap(pixmap)
+            lbl.setStyleSheet("border: 1px solid #3a3f58; border-radius: 4px;")
+            
+            row = idx // 2
+            col = idx % 2
+            self.gallery_layout.addWidget(lbl, row, col)
+
+    def closeEvent(self, event):
+        self.thread.stop()
+        event.accept()
+
+    # ---------------- 高级深色 QSS 样式表 ----------------
+    def _apply_stylesheet(self):
+        qss = """
+            QMainWindow {
+                background-color: #0f111a;
+            }
+            #HeaderTitle {
+                color: #ffffff;
+                font-size: 20px;
+                font-weight: bold;
+                font-family: 'Segoe UI', sans-serif;
+            }
+            #BadgeCamera {
+                background-color: #2ecc71;
+                color: #000;
+                font-size: 11px;
+                font-weight: bold;
+                border-radius: 4px;
+                padding: 3px 8px;
+            }
+            #BadgeVideo {
+                background-color: #3498db;
+                color: #fff;
+                font-size: 11px;
+                font-weight: bold;
+                border-radius: 4px;
+                padding: 3px 8px;
+            }
+            #VideoScreen {
+                background-color: #000000;
+                border: 2px solid #1a1d2e;
+                border-radius: 12px;
+            }
+            #Card {
+                background-color: #16192b;
+                border: 1px solid #232740;
+                border-radius: 12px;
+                padding: 10px;
+            }
+            #SubTitle {
+                color: #8b92b2;
+                font-size: 13px;
+                font-weight: bold;
+            }
+            #AngleDisplay {
+                color: #00f0ff;
+                font-size: 48px;
+                font-weight: bold;
+                font-family: 'Arial';
+                margin: 5px 0px;
+            }
+            #RefText {
+                color: #a0a5c0;
+                font-size: 12px;
+                line-height: 1.6;
+            }
+            QPushButton {
+                background-color: #222744;
+                color: #d1d5db;
+                border: 1px solid #333a63;
+                border-radius: 8px;
+                padding: 10px 16px;
+                font-size: 13px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background-color: #2d345b;
+                border-color: #00f0ff;
+                color: #ffffff;
+            }
+            QPushButton:pressed {
+                background-color: #181c33;
+            }
+            #BtnSmall {
+                padding: 4px 8px;
+                font-size: 11px;
+            }
+            QScrollArea {
+                border: none;
+                background-color: transparent;
+            }
+            QScrollBar:vertical {
+                background: #16192b;
+                width: 6px;
+            }
+            QScrollBar::handle:vertical {
+                background: #333a63;
+                border-radius: 3px;
+            }
+        """
+        self.setStyleSheet(qss)
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = BasketballAnalyzerUI()
+    window.show()
+    sys.exit(app.exec())
